@@ -5,6 +5,7 @@ import asyncio
 import json
 import os
 import random
+import sys
 import time
 from pathlib import Path
 
@@ -16,6 +17,19 @@ from config import api_key, DEFAULT_MODEL
 # Set high enough that all shards fire together for a typical doc.
 MAX_CONCURRENCY = int(os.environ.get("PDF_TRANSLATE_CONCURRENCY", "32"))
 MAX_RETRIES = int(os.environ.get("PDF_TRANSLATE_RETRIES", "3"))
+
+# Append to the same debug log pipeline.py uses (decoupled — no import to avoid a cycle).
+_DEBUG_LOG = Path(__file__).resolve().parent / "runs" / "pipeline_debug.log"
+
+
+def _log(msg: str) -> None:
+    line = f"[translate] {time.strftime('%H:%M:%S')} {msg}"
+    print(line, file=sys.stderr, flush=True)
+    try:
+        with _DEBUG_LOG.open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
 
 SYSTEM_PROMPT = """You translate one shard of a document into the target language.
 
@@ -72,23 +86,28 @@ async def _translate_entries(
     entries: list,
     target: str,
     model: str,
+    label: str = "",
 ) -> tuple[dict, int, int]:
     """Call the API with retries on transient errors (429 / overloaded / timeouts)."""
     last_err: Exception | None = None
     for attempt in range(MAX_RETRIES + 1):
         try:
             return await _call_once(client, entries, target, model)
-        except Exception as e:  # noqa: BLE001 — retry any transient failure
+        except Exception as e:  # noqa: BLE001 — retry transient + bad-output failures
             last_err = e
             if attempt >= MAX_RETRIES:
                 break
             msg = str(e).lower()
-            transient = any(
-                s in msg for s in ("overloaded", "rate", "429", "timeout", "timed out", "connection", "529")
-            )
-            if not transient:
+            # Network/server transients AND model-output errors (malformed JSON, missing keys):
+            # re-asking the model almost always fixes the latter, so both are worth a retry.
+            is_ratelimit = any(s in msg for s in ("overloaded", "rate", "429", "timeout", "timed out", "connection", "529"))
+            is_badoutput = isinstance(e, (json.JSONDecodeError, ValueError)) or "missing keys" in msg
+            if not (is_ratelimit or is_badoutput):
                 break
-            await asyncio.sleep((2 ** attempt) + random.uniform(0, 0.5))
+            backoff = round((2 ** attempt) + random.uniform(0, 0.5), 2)
+            kind = "rate-limit" if is_ratelimit else "bad-output"
+            _log(f"{label or 'shard'}: retry {attempt+1}/{MAX_RETRIES} ({kind}, backoff {backoff}s): {str(e)[:90]}")
+            await asyncio.sleep(backoff)
     raise last_err if last_err else RuntimeError("translate failed")
 
 
@@ -104,7 +123,9 @@ async def _translate_one_shard(
     t0 = time.monotonic()
     try:
         async with sem:
-            translations, in_tok, out_tok = await _translate_entries(client, entries, target, model)
+            translations, in_tok, out_tok = await _translate_entries(
+                client, entries, target, model, label=f"shard{shard_id}"
+            )
     except Exception as e:
         return {"shard_id": shard_id, "ok": False, "error": str(e), "elapsed_s": round(time.monotonic() - t0, 2)}
     out_path = work_dir / f"tr_part{shard_id}.json"

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """apply.py — pdf-translate skill, stage 2. Usage: python3 apply.py <workdir> <output.pdf> --target <lang_code>"""
-import sys, os, re, json, html, subprocess, urllib.request, multiprocessing as mp, tempfile, shutil, time
+import sys, os, re, json, html, subprocess, urllib.request, tempfile, shutil, time
 def ensure(mod, pip=None):
     try: return __import__(mod)
     except ImportError: pass
@@ -32,6 +32,12 @@ DEC = opt("--decimal", _prof[0] if _prof else None)
 THO = opt("--thousands", _prof[1] if _prof else None)
 PCT_SPACE = _prof[2] if _prof else None
 RENDER = [int(x) for x in opt("--render","").split(",") if x] if opt("--render") else []
+# Worker mode (portable parallelism, no fork): render only pages a..b (0-based incl) to PART, then exit.
+RENDER_RANGE = None
+if "--render-range" in args:
+    _ri = args.index("--render-range"); RENDER_RANGE = (int(args[_ri+1]), int(args[_ri+2]), args[_ri+3])
+_HAS_DEC = "--decimal" in args
+_HAS_THO = "--thousands" in args
 _t0 = time.monotonic()
 slots = json.load(open(f"{WORK}/slots.json",encoding="utf-8"))
 units, SRC = slots["units"], slots["src"]
@@ -223,7 +229,6 @@ N_PAGES = fitz.open(SRC).page_count
 # Speed-over-cost: more workers + fewer pages/worker = faster render on multi-core (Linux fork).
 APPLY_MAX_WORKERS = int(os.environ.get("PDF_APPLY_MAX_WORKERS", "8"))
 PAGES_PER_WORKER = int(os.environ.get("PDF_APPLY_PAGES_PER_WORKER", "4"))
-HAVE_FORK = "fork" in mp.get_all_start_methods()
 def _nworkers(npages):
     if WORKERS_OVERRIDE is not None: return max(1, WORKERS_OVERRIDE)
     cpu = os.cpu_count() or 4
@@ -241,15 +246,48 @@ def page_chunks(n, lo=0, hi=None):
             chunks.append((start,p)); start = p+1; acc = 0
     chunks.append((start, hi))
     return chunks
-def _worker(job):
-    p0,p1,tmp = job
-    global ARCHIVE; ARCHIVE = fitz.Archive(FDIR)
-    d = fitz.open(SRC); ov,sh,idk,rf = render_page_range(d,p0,p1)
-    out = fitz.open(); out.insert_pdf(d,from_page=p0,to_page=p1)
-    try: out.subset_fonts()
-    except Exception: pass
-    out.save(tmp,garbage=4,deflate=True); out.close(); d.close()
-    return tmp,ov,sh,sorted(idk),rf
+def _render_range(p0, p1):
+    """Render pages p0..p1 (0-based incl) across parallel subprocesses (portable; no fork).
+    Returns (doc, overflow, shrunk, identical, reflowed). Falls back to serial for small ranges."""
+    n = _nworkers(p1 - p0 + 1)
+    if n > 1 and p1 > p0:
+        tmpdir = tempfile.mkdtemp(prefix="pdftrans_")
+        try:
+            chunks = page_chunks(n, p0, p1)
+            extra = []
+            if _HAS_DEC and DEC is not None: extra += ["--decimal", DEC]
+            if _HAS_THO and THO is not None: extra += ["--thousands", THO]
+            procs = []
+            for i,(a,b) in enumerate(chunks):
+                part = os.path.join(tmpdir, f"part_{i:02d}.pdf")
+                cmd = [sys.executable, os.path.abspath(__file__), WORK, OUT,
+                       "--target", TARGET, *extra, "--render-range", str(a), str(b), part]
+                procs.append((a, b, part, subprocess.Popen(
+                    cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)))
+            print(f"rendering pages {p0+1}-{p1+1} across {len(procs)} subprocess worker(s): "
+                  + ", ".join(f"{a+1}-{b+1}" for a,b,_,_ in procs))
+            merged = fitz.open(); ov,sh,idk,rf = [],[],set(),[]
+            errors = []
+            for a,b,part,pr in procs:
+                _o, _e = pr.communicate()
+                meta = part + ".meta.json"
+                if pr.returncode != 0 or not os.path.exists(part) or not os.path.exists(meta):
+                    tail = _e.decode("utf-8","replace")[-400:] if _e else ""
+                    errors.append(f"worker {a+1}-{b+1} failed (rc={pr.returncode}): {tail}")
+                    continue
+                m = json.load(open(meta, encoding="utf-8"))
+                pp = fitz.open(part); merged.insert_pdf(pp); pp.close()
+                ov += [tuple(x) for x in m["overflow"]]
+                sh += [tuple(x) for x in m["shrunk"]]
+                idk |= set(m["identical"])
+                rf += [tuple(x) for x in m["reflowed"]]
+            if errors:
+                merged.close(); raise RuntimeError("; ".join(errors))
+            return merged, ov, sh, idk, rf
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+    d = fitz.open(SRC); ov,sh,idk,rf = render_page_range(d, p0, p1)
+    return d, ov, sh, idk, rf
 def _paths_for(out):
     i = max(out.rfind("/"), out.rfind("\\"))            # handle / and \ (OUT may be a Windows path on a Linux mount)
     if i >= 0: d, sep, name = out[:i], out[i], out[i+1:]
@@ -313,25 +351,18 @@ def _print_timing(t_render, t_finish):
     print(f"  save + finish: {t_finish:6.2f}s")
     print(f"  TOTAL:         {total:6.2f}s")
     print("=" * 50)
-def _render_range(p0, p1):
-    """Render pages p0..p1 (0-based incl), forking across cores when it helps; return (doc, overflow, shrunk, identical, reflowed)."""
-    n = _nworkers(p1 - p0 + 1)
-    if n > 1 and HAVE_FORK and p1 > p0:
-        tmpdir = tempfile.mkdtemp(prefix="pdftrans_")
-        try:
-            jobs = [(a,b,os.path.join(tmpdir,f"part_{i:02d}.pdf")) for i,(a,b) in enumerate(page_chunks(n,p0,p1))]
-            print(f"rendering pages {p0+1}-{p1+1} across {len(jobs)} worker(s): "+", ".join(f"{a+1}-{b+1}" for a,b,_ in jobs))
-            with mp.get_context("fork").Pool(len(jobs)) as pool: results = pool.map(_worker, jobs)
-            merged = fitz.open(); ov,sh,idk,rf = [],[],set(),[]
-            for tmp,o,s,i,r in results:
-                part = fitz.open(tmp); merged.insert_pdf(part); part.close()
-                ov += o; sh += s; idk |= set(i); rf += r
-            return merged, ov, sh, idk, rf
-        finally:
-            shutil.rmtree(tmpdir, ignore_errors=True)
-    d = fitz.open(SRC); ov,sh,idk,rf = render_page_range(d, p0, p1)
-    return d, ov, sh, idk, rf
 if __name__ == "__main__":
+    # Worker mode: render just our page range, write a partial PDF + sidecar meta, exit.
+    if RENDER_RANGE is not None:
+        _a, _b, _part = RENDER_RANGE
+        _d = fitz.open(SRC); _ov,_sh,_idk,_rf = render_page_range(_d, _a, _b)
+        _out = fitz.open(); _out.insert_pdf(_d, from_page=_a, to_page=_b)
+        try: _out.subset_fonts()
+        except Exception: pass
+        _out.save(_part, garbage=4, deflate=True); _out.close(); _d.close()
+        json.dump({"overflow": _ov, "shrunk": _sh, "identical": sorted(_idk), "reflowed": _rf},
+                  open(_part + ".meta.json", "w", encoding="utf-8"), ensure_ascii=False)
+        sys.exit(0)
     t_render = time.monotonic()
     try:
         doc, ov, sh, idk, rf = _render_range(0, N_PAGES-1)
