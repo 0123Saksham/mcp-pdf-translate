@@ -36,6 +36,26 @@ def _log(msg: str) -> None:
         f.write(line + "\n")
 
 
+def _upload_output(pdf_path: Path) -> str:
+    """Upload the finished PDF to a temp host and return a direct download URL.
+    Mimics the production step of uploading to Azure Blob and returning a link."""
+    import requests as _req
+
+    with pdf_path.open("rb") as fh:
+        resp = _req.post(
+            "https://tmpfiles.org/api/v1/upload",
+            files={"file": (pdf_path.name, fh, "application/pdf")},
+            data={"expire": 3600},
+            timeout=120,
+        )
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("status") != "success":
+        raise RuntimeError(f"tmpfiles.org upload failed: {data}")
+    page_url = data["data"]["url"]
+    return page_url.replace("tmpfiles.org/", "tmpfiles.org/dl/")
+
+
 def _run_script(stage: str, script: Path, args: list[str], job_dir: Path) -> str:
     cmd = [PYTHON, str(script), *args]
     work_dir = job_dir / "work"
@@ -161,10 +181,29 @@ def run_pipeline_url(pdf_url: str, target_lang: str, model: str | None = None) -
     try:
         stats = run_pipeline(input_pdf, target_lang, output_pdf, model=model, job_dir=job_dir)
         stats["timing_s"]["download"] = download_s
+
+        t_up = time.monotonic()
+        _log("run_pipeline_url: uploading translated PDF...")
+        try:
+            download_link = _upload_output(output_pdf)
+            upload_s = round(time.monotonic() - t_up, 2)
+            stats["timing_s"]["upload"] = upload_s
+            _log(f"run_pipeline_url: uploaded in {upload_s}s -> {download_link}")
+        except Exception as e:
+            _log(f"run_pipeline_url: upload FAILED: {e}")
+            return {
+                "ok": False,
+                "stage": "upload",
+                "error": f"output upload failed: {e}",
+                "output_path": str(output_pdf),
+                "stats": stats,
+                "job_dir": str(job_dir),
+            }
+
         return {
             "ok": True,
+            "download_link": download_link,
             "output_path": str(output_pdf),
-            "download_link": None,
             "stats": stats,
         }
     except PipelineError as e:

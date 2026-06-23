@@ -3,8 +3,9 @@
 pdf-translate MCP server (stdio).
 
 Tool:
-  translate_pdf_url — accepts a temporary download URL, server downloads the PDF
-                      and runs the full pipeline (extract → translate → check → apply).
+  translate_pdf_url — accepts a temporary download URL, server downloads the PDF,
+                      runs the full pipeline (extract → translate → check → apply),
+                      uploads the result, and returns a download link.
 """
 from __future__ import annotations
 
@@ -28,8 +29,9 @@ mcp = FastMCP(
     instructions=(
         "Translates PDF text layers while preserving layout. "
         "Call translate_pdf_url with a temporary download URL (e.g. tmpfiles.org/dl/...) "
-        "and a target language code. The server downloads the PDF and runs the full "
-        "pipeline: extract → parallel API translate → check → apply."
+        "and a target language code. The server downloads the PDF, runs the full "
+        "pipeline (extract → parallel API translate → check → apply), uploads the "
+        "translated PDF, and returns its download link as 'download_link'."
     ),
 )
 
@@ -45,12 +47,15 @@ async def translate_pdf_url(pdf_url: str, target_lang: str) -> str:
 
     The skill script uploads the user's PDF to a temp file host (e.g. tmpfiles.org)
     and passes the direct download URL here. The server downloads the PDF itself —
-    the LLM never touches the file bytes.
+    the LLM never touches the file bytes. After translating, the server uploads the
+    finished PDF and returns its download link as "download_link".
 
     Args:
         pdf_url: Direct download URL to a PDF file (must return raw PDF bytes,
                  not an HTML page). Use tmpfiles.org/dl/... format.
         target_lang: ISO language code for output (e.g. en, hi, ar, de, fr).
+
+    Returns JSON with: ok, download_link (URL of translated PDF), output_path, stats.
     """
     if not pdf_url or not pdf_url.strip():
         return _json_result({"ok": False, "stage": "input", "error": "pdf_url is required"})
