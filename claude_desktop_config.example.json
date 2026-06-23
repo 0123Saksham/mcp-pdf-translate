@@ -1,0 +1,21 @@
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "C:\\Users\\neelima\\Desktop",
+        "C:\\Users\\neelima\\Downloads",
+        "D:\\Internship\\skill\\pdf-translate-mcp\\runs"
+      ]
+    },
+    "pdf-translate": {
+      "command": "C:\\Users\\neelima\\Anaconda3\\python.exe",
+      "args": ["D:\\Internship\\skill\\pdf-translate-mcp\\server.py"],
+      "env": {
+        "ANTHROPIC_API_KEY": "sk-ant-REPLACE_ME"
+      }
+    }
+  }
+}
