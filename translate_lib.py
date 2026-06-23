@@ -43,16 +43,34 @@ RULES (non-negotiable):
 - Keep terminology and register consistent throughout the shard.
 - Try to stay within "max" chars but do not sacrifice meaning to do so.
 
-OUTPUT FORMAT (strict):
-Respond with EXACTLY ONE compact JSON object mapping each key to its translation:
-{"<k>": "<translation>", "<k>": "<translation>", ...}
-
-No markdown fences, no commentary, no preamble. Just the JSON object."""
+For each input entry, return one item whose "k" is that entry's key and whose "t" is the translation."""
 
 USER_TEMPLATE = """Target language: {target}
 
 Translate these strings:
 {shard_json}"""
+
+# Schema for the API's structured output (output_config). The shape is enforced
+# by the API, so the prompt no longer has to describe the JSON format.
+RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "translations": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "k": {"type": "string"},
+                    "t": {"type": "string"},
+                },
+                "required": ["k", "t"],
+                "additionalProperties": False,
+            },
+        }
+    },
+    "required": ["translations"],
+    "additionalProperties": False,
+}
 
 
 async def _call_once(
@@ -68,13 +86,12 @@ async def _call_once(
         max_tokens=16000,
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": user_msg}],
+        output_config={"format": {"type": "json_schema", "schema": RESPONSE_SCHEMA}},
     )
     text = "".join(b.text for b in response.content if b.type == "text").strip()
-    if text.startswith("```"):
-        lines = text.split("\n")
-        text = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
-    translations = json.loads(text)
-    expected = {e["k"] for e in entries}
+    data = json.loads(text)
+    translations = {str(item["k"]): item["t"] for item in data["translations"]}
+    expected = {str(e["k"]) for e in entries}
     missing = expected - set(translations.keys())
     if missing:
         raise RuntimeError(f"translation missing keys: {sorted(missing)[:20]}")
