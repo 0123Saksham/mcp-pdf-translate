@@ -2,3 +2,4 @@ mcp>=1.0.0
 anthropic>=0.40.0
 pymupdf>=1.23.0
 requests>=2.31.0
+azure-storage-blob>=12.20.0

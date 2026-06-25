@@ -36,24 +36,22 @@ def _log(msg: str) -> None:
         f.write(line + "\n")
 
 
-def _upload_output(pdf_path: Path) -> str:
-    """Upload the finished PDF to a temp host and return a direct download URL.
-    Mimics the production step of uploading to Azure Blob and returning a link."""
-    import requests as _req
+OUTPUT_LINK_EXPIRY_HOURS = 24
 
-    with pdf_path.open("rb") as fh:
-        resp = _req.post(
-            "https://tmpfiles.org/api/v1/upload",
-            files={"file": (pdf_path.name, fh, "application/pdf")},
-            data={"expire": 3600},
-            timeout=120,
-        )
-    resp.raise_for_status()
-    data = resp.json()
-    if data.get("status") != "success":
-        raise RuntimeError(f"tmpfiles.org upload failed: {data}")
-    page_url = data["data"]["url"]
-    return page_url.replace("tmpfiles.org/", "tmpfiles.org/dl/")
+
+def _upload_output(pdf_path: Path) -> str:
+    """Upload the finished PDF to Azure Blob storage and return a read SAS URL.
+
+    The blob lands under a unique outputs/<uuid>/ path so concurrent jobs never
+    collide. The returned URL is read-only and valid for OUTPUT_LINK_EXPIRY_HOURS.
+    """
+    import uuid
+
+    from azure_storage import generate_download_sas_url, upload_blob
+
+    blob_name = f"outputs/{uuid.uuid4().hex}/{pdf_path.name}"
+    upload_blob(blob_name, pdf_path.read_bytes())
+    return generate_download_sas_url(blob_name, expiry_hours=OUTPUT_LINK_EXPIRY_HOURS)
 
 
 def _run_script(stage: str, script: Path, args: list[str], job_dir: Path) -> str:

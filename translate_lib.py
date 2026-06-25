@@ -17,6 +17,10 @@ from config import api_key, DEFAULT_MODEL
 # Set high enough that all shards fire together for a typical doc.
 MAX_CONCURRENCY = int(os.environ.get("PDF_TRANSLATE_CONCURRENCY", "32"))
 MAX_RETRIES = int(os.environ.get("PDF_TRANSLATE_RETRIES", "3"))
+TEMPERATURE = float(os.environ.get("PDF_TRANSLATE_TEMPERATURE", "0"))
+# Low effort = fewer output tokens, faster responses. Thinking is disabled, so
+# effort only trims text-output spend here (no reasoning to scale).
+EFFORT = os.environ.get("PDF_TRANSLATE_EFFORT", "low")
 
 # Append to the same debug log pipeline.py uses (decoupled — no import to avoid a cycle).
 _DEBUG_LOG = Path(__file__).resolve().parent / "runs" / "pipeline_debug.log"
@@ -84,9 +88,14 @@ async def _call_once(
     response = await client.messages.create(
         model=model,
         max_tokens=16000,
+        temperature=TEMPERATURE,
+        thinking={"type": "disabled"},
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": user_msg}],
-        output_config={"format": {"type": "json_schema", "schema": RESPONSE_SCHEMA}},
+        output_config={
+            "effort": EFFORT,
+            "format": {"type": "json_schema", "schema": RESPONSE_SCHEMA},
+        },
     )
     text = "".join(b.text for b in response.content if b.type == "text").strip()
     data = json.loads(text)
@@ -190,6 +199,8 @@ async def run_translate(
             return_exceptions=True,
         )
         failures = []
+        entry_counts = {sid: len(ent) for sid, ent in jobs}
+        shard_timings = []
         for r in results:
             if isinstance(r, Exception):
                 failures.append(str(r))
@@ -199,8 +210,19 @@ async def run_translate(
             else:
                 total_in += r["input_tokens"]
                 total_out += r["output_tokens"]
+                shard_timings.append({
+                    "shard_id": r["shard_id"],
+                    "entries": entry_counts.get(r["shard_id"]),
+                    "elapsed_s": r["elapsed_s"],
+                    "input_tokens": r["input_tokens"],
+                    "output_tokens": r["output_tokens"],
+                })
         if failures:
             raise RuntimeError(f"translate failed: {failures[0]}")
+        shard_timings.sort(key=lambda x: x["shard_id"])
+        (work_dir / "shard_timings.json").write_text(
+            json.dumps(shard_timings, indent=2), encoding="utf-8"
+        )
     else:
         todo_path = work_dir / "to_translate.json"
         if not todo_path.exists():
