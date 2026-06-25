@@ -48,6 +48,35 @@ def api_key() -> str:
     return key
 
 
+def google_project() -> str:
+    """Google Cloud project id for the Translation API.
+
+    Reads GOOGLE_CLOUD_PROJECT, else falls back to the project_id inside the
+    service-account JSON pointed to by GOOGLE_APPLICATION_CREDENTIALS.
+    """
+    proj = os.environ.get("GOOGLE_CLOUD_PROJECT", "").strip()
+    if proj:
+        return proj
+    key_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+    if key_path and Path(key_path).is_file():
+        import json
+        try:
+            proj = json.loads(Path(key_path).read_text(encoding="utf-8")).get("project_id", "").strip()
+        except Exception:
+            proj = ""
+    if not proj:
+        raise RuntimeError(
+            "GOOGLE_CLOUD_PROJECT is not set and no project_id found in the "
+            f"service-account key. Add it to {MCP_ROOT / '.env'} or the MCP env block."
+        )
+    return proj
+
+
+def google_location() -> str:
+    """Region for translate_text. 'global' is the fastest/most available."""
+    return os.environ.get("GOOGLE_TRANSLATE_LOCATION", "global").strip() or "global"
+
+
 def azure_connection_string() -> str:
     val = os.environ.get("AZURE_STORAGE_CONNECTION_STRING", "").strip()
     if not val:

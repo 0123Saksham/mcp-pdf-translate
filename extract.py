@@ -167,14 +167,15 @@ def _write(entries, prefix):
         paths.append(f"batches/{name}")
     return paths
 V = sum(len(e["s"]) for e in todo)
-# Aggressive sharding for direct parallel API calls (no subagent spawn overhead).
-# More shards = fewer output tokens per call = the slowest call finishes sooner.
-# Tunable via env (speed-over-cost): smaller CHARS_PER_SHARD + higher MAX_WORKERS = faster.
+# Shard so each shard fits a SINGLE Google translate_text call (30k-codepoint limit).
+# We send only the text (not JSON), so the budget applies to sum(len(s)); CHARS_PER_SHARD
+# of 25000 leaves headroom and yields ~3-4 shards for a typical 50-page doc.
+# ceil() guarantees no shard exceeds the target. Tunable via env.
 MAX_WORKERS = int(os.environ.get("PDF_TRANSLATE_MAX_SHARDS", "32"))
-CHARS_PER_SHARD = int(os.environ.get("PDF_TRANSLATE_CHARS_PER_SHARD", "3000"))
+CHARS_PER_SHARD = int(os.environ.get("PDF_TRANSLATE_CHARS_PER_SHARD", "25000"))
 if WORKERS_OVERRIDE is not None: N = max(1, WORKERS_OVERRIDE)
 elif not todo: N = 1
-else: N = min(max(round(V/CHARS_PER_SHARD), 1), MAX_WORKERS)
+else: N = min(max(-(-V // CHARS_PER_SHARD), 1), MAX_WORKERS)
 N = min(N, len(todo)) if todo else 1
 PARALLEL = N > 1
 if not PARALLEL:

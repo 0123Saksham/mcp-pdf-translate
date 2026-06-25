@@ -1,9 +1,17 @@
-"""Full pdf-translate pipeline: extract → translate → check → apply."""
+"""Full pdf-translate pipeline: extract → translate → check → apply.
+
+All four stages run in-process (no per-step subprocess). extract/check/apply are
+executed in-process via runpy with their CLI argv set; only apply may spawn a small
+number of page-render worker subprocesses (capped in apply.py)."""
 from __future__ import annotations
 
 import asyncio
-import subprocess
+import contextlib
+import runpy
+import sys
+import threading
 import time
+import traceback
 from pathlib import Path
 
 import fitz
@@ -12,7 +20,6 @@ from config import (
     APPLY_PY,
     CHECK_PY,
     EXTRACT_PY,
-    PYTHON,
     new_job_dir,
 )
 from translate_lib import run_translate
@@ -54,20 +61,47 @@ def _upload_output(pdf_path: Path) -> str:
     return generate_download_sas_url(blob_name, expiry_hours=OUTPUT_LINK_EXPIRY_HOURS)
 
 
-def _run_script(stage: str, script: Path, args: list[str], job_dir: Path) -> str:
-    cmd = [PYTHON, str(script), *args]
+# Stage scripts (extract/check/apply) are CLI scripts driven by sys.argv. We run
+# them in-process with runpy instead of spawning a subprocess per step. sys.argv and
+# stdout/stderr are process-global, so a lock serializes concurrent in-process runs.
+_INPROC_LOCK = threading.Lock()
+
+
+def _run_inproc(stage: str, script: Path, args: list[str], job_dir: Path) -> str:
+    """Execute a stage script in-process (run_name='__main__') with the given argv.
+
+    Captures the script's stdout/stderr to work/<stage>.log and maps its sys.exit
+    code onto PipelineError, matching the previous subprocess contract.
+    """
     work_dir = job_dir / "work"
     work_dir.mkdir(parents=True, exist_ok=True)
     log_path = work_dir / f"{stage}.log"
-    _log(f"{stage}: launching subprocess → {script.name}")
+    _log(f"{stage}: running in-process → {script.name}")
     t0 = time.monotonic()
-    with log_path.open("wb") as logf:
-        proc = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=logf, stderr=subprocess.STDOUT)
+    code = 0
+    with _INPROC_LOCK:
+        old_argv = sys.argv
+        sys.argv = [str(script), *args]
+        try:
+            with log_path.open("w", encoding="utf-8", errors="replace") as logf:
+                with contextlib.redirect_stdout(logf), contextlib.redirect_stderr(logf):
+                    try:
+                        runpy.run_path(str(script), run_name="__main__")
+                    except SystemExit as e:
+                        c = e.code
+                        code = 0 if c is None else (c if isinstance(c, int) else 1)
+                        if isinstance(c, str):
+                            logf.write(c + "\n")
+                    except Exception:
+                        code = 1
+                        traceback.print_exc(file=logf)
+        finally:
+            sys.argv = old_argv
     elapsed = round(time.monotonic() - t0, 2)
-    _log(f"{stage}: subprocess done in {elapsed}s (exit={proc.returncode})")
+    _log(f"{stage}: in-process done in {elapsed}s (exit={code})")
     out = log_path.read_text(encoding="utf-8", errors="replace").strip() if log_path.is_file() else ""
-    if proc.returncode != 0:
-        raise PipelineError(stage, out or f"{stage} exited {proc.returncode}", proc.returncode)
+    if code != 0:
+        raise PipelineError(stage, out or f"{stage} exited {code}", code)
     return out
 
 
@@ -106,7 +140,7 @@ def run_pipeline(
     _log(f"run_pipeline: starting for {input_pdf.name} → {target_lang}")
 
     t0 = time.monotonic()
-    _run_script("extract", EXTRACT_PY, [str(input_pdf), str(work_dir)], job_dir)
+    _run_inproc("extract", EXTRACT_PY, [str(input_pdf), str(work_dir)], job_dir)
     timings["extract"] = round(time.monotonic() - t0, 2)
     _log(f"run_pipeline: extract done in {timings['extract']}s")
 
@@ -117,12 +151,12 @@ def run_pipeline(
     _log(f"run_pipeline: translate done in {timings['translate']}s — {tr_stats['strings_translated']} strings")
 
     t0 = time.monotonic()
-    _run_script("check", CHECK_PY, [str(work_dir)], job_dir)
+    _run_inproc("check", CHECK_PY, [str(work_dir)], job_dir)
     timings["check"] = round(time.monotonic() - t0, 2)
     _log(f"run_pipeline: check done in {timings['check']}s")
 
     t0 = time.monotonic()
-    _run_script("apply", APPLY_PY, [str(work_dir), str(output_pdf), "--target", target_lang], job_dir)
+    _run_inproc("apply", APPLY_PY, [str(work_dir), str(output_pdf), "--target", target_lang], job_dir)
     timings["apply"] = round(time.monotonic() - t0, 2)
     _log(f"run_pipeline: apply done in {timings['apply']}s")
 

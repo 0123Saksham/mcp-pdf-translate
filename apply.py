@@ -226,9 +226,11 @@ def render_page_range(doc, p0, p1):
             elif scale<0.999: shrunk.append((pno+1,round(scale,2),label))
     return overflow,shrunk,identical,reflowed
 N_PAGES = fitz.open(SRC).page_count
-# Speed-over-cost: more workers + fewer pages/worker = faster render on multi-core (Linux fork).
-APPLY_MAX_WORKERS = int(os.environ.get("PDF_APPLY_MAX_WORKERS", "8"))
-PAGES_PER_WORKER = int(os.environ.get("PDF_APPLY_PAGES_PER_WORKER", "4"))
+# Production MCP server allows only a couple of child processes here, so the render
+# worker pool is capped low (default 3). Higher = faster on multi-core but more
+# subprocesses; set PDF_APPLY_MAX_WORKERS=1 to render fully in-process (no children).
+APPLY_MAX_WORKERS = int(os.environ.get("PDF_APPLY_MAX_WORKERS", "3"))
+PAGES_PER_WORKER = int(os.environ.get("PDF_APPLY_PAGES_PER_WORKER", "8"))
 def _nworkers(npages):
     if WORKERS_OVERRIDE is not None: return max(1, WORKERS_OVERRIDE)
     cpu = os.cpu_count() or 4
